@@ -14,14 +14,14 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 from config import VESSEL_COMPANIES
-from api_helper import search_vessels, get_vessel_details, get_vessel_events, resolve_vessel_by_mmsi
+from api_helper import search_vessels, get_vessel_details, get_vessel_events, resolve_vessel_by_mmsi, load_cached_events_from_csv, sync_vessels_with_api
 
 # ---------------------------------------------------------------------------
 # Page configuration — NO sidebar
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Fleet Vessel Tracker",
-    page_icon="🚢",
+    page_icon="⬡",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -140,7 +140,7 @@ header[data-testid="stHeader"] { background: transparent; }
 st.markdown("""
 <div class="dash-header">
   <div class="left">
-    <h1>🚢 Fleet Vessel Tracker</h1>
+    <h1>Fleet Vessel Tracker</h1>
     <p>Track vessel paths and detect apparent fishing, loitering, port visits, and encounters using GFW API v3.</p>
   </div>
   <div class="right">
@@ -178,7 +178,7 @@ with fil_c3:
     end_date = st.date_input("End Date", value=default_end)
 
 # ---------------------------------------------------------------------------
-# Resolve all vessels in the selected company
+# Load vessels in the selected company (Offline)
 # ---------------------------------------------------------------------------
 vessels_in_company = VESSEL_COMPANIES.get(selected_company, [])
 
@@ -186,34 +186,42 @@ if not vessels_in_company:
     st.warning(f"No vessels listed under **{selected_company}**. Add rows in vessels.xlsx.")
     st.stop()
 
+# Compile the list of active vessels with colors and flags from the CSV cache
 resolved_vessels: list[dict] = []
-for v in vessels_in_company:
-    resolved = resolve_vessel_by_mmsi(v["mmsi"], display_name=v["name"])
-    if resolved:
-        resolved_vessels.append(resolved)
+import os
+csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfw_extracted_data.csv")
 
-if not resolved_vessels:
-    st.error("Could not resolve any vessels from Global Fishing Watch. Check the MMSI numbers in vessels.xlsx.")
-    st.stop()
+for idx, v in enumerate(vessels_in_company):
+    mmsi = str(v["mmsi"]).strip()
+    flag = "N/A"
+    
+    if os.path.exists(csv_path):
+        try:
+            df_temp = pd.read_csv(csv_path, usecols=["vessel_mmsi", "vessel_flag"], dtype=str).dropna()
+            match = df_temp[df_temp["vessel_mmsi"] == mmsi]
+            if not match.empty:
+                flag = match.iloc[0]["vessel_flag"]
+        except Exception:
+            pass
 
-# Assign a color to each vessel
-for idx, rv in enumerate(resolved_vessels):
-    rv["color"] = VESSEL_PALETTE[idx % len(VESSEL_PALETTE)]
+    resolved_vessels.append({
+        "id": mmsi,
+        "name": v["name"],
+        "mmsi": mmsi,
+        "flag": flag,
+        "color": VESSEL_PALETTE[idx % len(VESSEL_PALETTE)]
+    })
 
 # ---------------------------------------------------------------------------
-# Fetch events for ALL vessels in the company
+# Fetch events for ALL vessels in the company (exclusively from local CSV)
 # ---------------------------------------------------------------------------
-all_events: list[dict] = []
-for vessel in resolved_vessels:
-    events = get_vessel_events(vessel["id"], start_date.isoformat(), end_date.isoformat())
-    for e in events:
-        e["vessel_name"] = vessel["name"]
-        e["vessel_mmsi"] = vessel["mmsi"]
-        e["vessel_color"] = vessel["color"]
-    all_events.extend(events)
+all_events = load_cached_events_from_csv(resolved_vessels, start_date, end_date)
 
-# Sort chronologically
-all_events.sort(key=lambda x: x.get("start") or "")
+# Assign colors to events for visualization in the app
+vessel_color_map = {rv["mmsi"]: rv["color"] for rv in resolved_vessels}
+for e in all_events:
+    e["vessel_color"] = vessel_color_map.get(e["vessel_mmsi"], "#ffffff")
+
 
 # ---------------------------------------------------------------------------
 # Vessel color legend
@@ -231,7 +239,7 @@ legend_html += '</div>'
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["🗺️ Vessel Tracking", "📊 Historical Analysis", "📋 Fleet Registry"])
+tab1, tab2, tab3 = st.tabs(["Vessel Tracking", "Historical Analysis", "Fleet Registry"])
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 1 — VESSEL TRACKING (multi-vessel map)
@@ -365,31 +373,7 @@ with tab1:
         else:
             st.info("Select at least one event type filter to view events on the map.")
 
-        # ── Events log table ─────────────────────────────────────────────
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("#### Events Log")
-        display_df = pd.DataFrame([
-            {
-                "Vessel": e["vessel_name"],
-                "Event Type": e["type"].replace("_", " ").title(),
-                "Start Time": e["start"],
-                "End Time": e["end"],
-                "Duration (h)": e["duration_hours"],
-                "Lat": e["lat"],
-                "Lon": e["lon"],
-                "Details": e["detail"],
-            }
-            for e in filtered_events
-        ])
 
-        if not display_df.empty:
-            st.dataframe(
-                display_df.sort_values("Start Time", ascending=False),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("No events to display.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -406,35 +390,45 @@ with tab2:
         df_hist["date"] = pd.to_datetime(df_hist["start"]).dt.date
         df_hist["duration_hours"] = df_hist["duration_hours"].astype(float)
 
-        # ── Chart 1: Timeline by vessel ──────────────────────────────────
-        st.markdown("#### Daily Event Count by Vessel")
+        # ── Chart 1: Monthly port visits by vessel ────────────────────────
+        st.markdown("#### Monthly Port Visits by Vessel")
 
-        timeline_data = (
-            df_hist.groupby(["date", "vessel_name"])
-            .size()
-            .reset_index(name="count")
-        )
-        timeline_data["date"] = pd.to_datetime(timeline_data["date"])
+        port_data = df_hist[df_hist["type"] == "port_visit"].copy()
+
+        if port_data.empty:
+            st.info("No port visit events recorded in this date range.")
+        else:
+            port_data["month"] = pd.to_datetime(port_data["start"]).dt.to_period("M").astype(str)
+
+            monthly_ports = (
+                port_data.groupby(["month", "vessel_name"])
+                .size()
+                .reset_index(name="trips")
+            )
+
+            vessel_names = [v["name"] for v in resolved_vessels]
+            vessel_colors = [v["color"] for v in resolved_vessels]
+
+            chart_ports = (
+                alt.Chart(monthly_ports)
+                .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+                .encode(
+                    x=alt.X("month:N", title="Month", sort=None),
+                    y=alt.Y("trips:Q", title="Port Visits"),
+                    color=alt.Color(
+                        "vessel_name:N",
+                        title="Vessel",
+                        scale=alt.Scale(domain=vessel_names, range=vessel_colors),
+                    ),
+                    xOffset="vessel_name:N",
+                    tooltip=["month:N", "vessel_name:N", "trips:Q"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart_ports, use_container_width=True)
 
         vessel_names = [v["name"] for v in resolved_vessels]
         vessel_colors = [v["color"] for v in resolved_vessels]
-
-        chart_timeline = (
-            alt.Chart(timeline_data)
-            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-            .encode(
-                x=alt.X("date:T", title="Date", axis=alt.Axis(format="%d %b %Y")),
-                y=alt.Y("count:Q", title="Events"),
-                color=alt.Color(
-                    "vessel_name:N",
-                    title="Vessel",
-                    scale=alt.Scale(domain=vessel_names, range=vessel_colors),
-                ),
-                tooltip=["date:T", "vessel_name:N", "count:Q"],
-            )
-            .properties(height=300)
-        )
-        st.altair_chart(chart_timeline, use_container_width=True)
 
         # ── Chart 2 & 3: Duration + Proportions ─────────────────────────
         st.markdown("<br>", unsafe_allow_html=True)
@@ -550,6 +544,41 @@ with tab2:
         else:
             st.info("No fishing events recorded in this date range.")
 
+        # ── Chart 5: Active vessels over time ─────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("#### Active Vessels Over Time")
+
+        df_hist["week"] = pd.to_datetime(df_hist["start"]).dt.to_period("W").apply(lambda r: r.start_time)
+
+        active_vessels = (
+            df_hist.groupby("week")["vessel_name"]
+            .nunique()
+            .reset_index(name="active_vessels")
+        )
+
+        chart_active = (
+            alt.Chart(active_vessels)
+            .mark_area(
+                line={"color": "#3b82f6", "strokeWidth": 2},
+                color=alt.Gradient(
+                    gradient="linear",
+                    stops=[
+                        alt.GradientStop(color="rgba(59,130,246,0.4)", offset=0),
+                        alt.GradientStop(color="rgba(59,130,246,0.02)", offset=1),
+                    ],
+                    x1=1, x2=1, y1=1, y2=0,
+                ),
+                interpolate="monotone",
+            )
+            .encode(
+                x=alt.X("week:T", title="Week"),
+                y=alt.Y("active_vessels:Q", title="Active Vessels", scale=alt.Scale(domain=[0, len(resolved_vessels)])),
+                tooltip=[alt.Tooltip("week:T", title="Week"), alt.Tooltip("active_vessels:Q", title="Vessels Active")],
+            )
+            .properties(height=280)
+        )
+        st.altair_chart(chart_active, use_container_width=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 3 — FLEET REGISTRY (all vessels in the company)
@@ -559,134 +588,45 @@ with tab3:
     st.markdown(legend_html, unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Fetch details for every vessel and build a fleet table
-    fleet_rows: list[dict] = []
-    detailed_registries: list[tuple[dict, dict | None]] = []
-
+    # Compile registry records from the CSV events
+    fleet_rows = []
+    events_df = pd.DataFrame(all_events)
+    
     for vessel in resolved_vessels:
-        details = get_vessel_details(vessel["id"])
-        detailed_registries.append((vessel, details))
-
-        info = {}
-        registry = {}
-        if details:
-            info = (
-                details.get("selfReportedInfo", [{}])[0]
-                if details.get("selfReportedInfo")
-                else {}
-            )
-            registry = (
-                details.get("registryInfo", [{}])[0]
-                if details.get("registryInfo")
-                else {}
-            )
-
-        # Extract characteristics
-        reg_list = details.get("registryInfo", []) if details else []
-        length = "N/A"
-        tonnage = "N/A"
-        power = "N/A"
-
-        if reg_list:
-            l_val = next((r.get("lengthM") for r in reg_list if r.get("lengthM")), None)
-            if l_val:
-                length = f"{l_val:.1f} m"
-            t_val = next((r.get("tonnageGt") for r in reg_list if r.get("tonnageGt")), None)
-            if t_val:
-                tonnage = f"{t_val:.1f} GT"
-            p_val = next(
-                (r.get("enginePowerKw") for r in reg_list if r.get("enginePowerKw")),
-                None,
-            )
-            if p_val:
-                power = f"{p_val:.1f} kW"
-
-        # Transmission period
-        tx_from = info.get("transmissionDateFrom", "N/A")
-        tx_to = info.get("transmissionDateTo", "N/A")
-        if tx_from and tx_from != "N/A":
-            tx_from = tx_from[:10]
-        if tx_to and tx_to != "N/A":
-            tx_to = tx_to[:10]
-
-        fleet_rows.append(
-            {
-                "Vessel Name": vessel["name"],
-                "MMSI": vessel["mmsi"],
-                "Flag": info.get("flag") or registry.get("flag", vessel.get("flag", "N/A")),
-                "IMO": info.get("imo") or registry.get("imo", "N/A"),
-                "Call Sign": info.get("callsign") or registry.get("callsign", "N/A"),
-                "Length": length,
-                "Tonnage": tonnage,
-                "Engine Power": power,
-                "Transmitting From": tx_from,
-                "Transmitting To": tx_to,
-                "GFW Vessel ID": vessel["id"],
-            }
-        )
-
-    # ── Fleet overview table ─────────────────────────────────────────
+        mmsi = vessel["mmsi"]
+        flag = vessel.get("flag", "N/A")
+        
+        vessel_events = pd.DataFrame()
+        if not events_df.empty and "vessel_mmsi" in events_df.columns:
+            vessel_events = events_df[events_df["vessel_mmsi"] == mmsi]
+            
+        first_tx = "N/A"
+        last_tx = "N/A"
+        total_events = 0
+        
+        if not vessel_events.empty:
+            total_events = len(vessel_events)
+            if "start" in vessel_events.columns:
+                starts = pd.to_datetime(vessel_events["start"], errors="coerce").dropna()
+                if not starts.empty:
+                    first_tx = starts.min().strftime("%Y-%m-%d")
+                    last_tx = starts.max().strftime("%Y-%m-%d")
+            
+            # Update flag if we can find a non-null flag in the events
+            if "vessel_flag" in vessel_events.columns:
+                flags = vessel_events["vessel_flag"].dropna().unique()
+                if len(flags) > 0 and flags[0] != "N/A" and str(flags[0]).strip() != "":
+                    flag = flags[0]
+                    
+        fleet_rows.append({
+            "Vessel Name": vessel["name"],
+            "MMSI": mmsi,
+            "Flag": flag,
+            "First Active Date": first_tx,
+            "Last Active Date": last_tx,
+            "Total Recorded Events": total_events
+        })
+        
     st.markdown("#### Fleet Overview")
     fleet_df = pd.DataFrame(fleet_rows)
     st.dataframe(fleet_df, use_container_width=True, hide_index=True)
-
-    # ── Per-vessel detailed registry cards ───────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("#### Vessel Registry Details")
-
-    for vessel, details in detailed_registries:
-        with st.expander(f"🚢 {vessel['name']}  ({vessel['mmsi']})", expanded=False):
-            if not details:
-                st.warning("Registry metadata could not be fetched.")
-                continue
-
-            col_r1, col_r2 = st.columns(2)
-
-            with col_r1:
-                st.markdown("**Identifiers**")
-                info = (
-                    details.get("selfReportedInfo", [{}])[0]
-                    if details.get("selfReportedInfo")
-                    else {}
-                )
-                registry = (
-                    details.get("registryInfo", [{}])[0]
-                    if details.get("registryInfo")
-                    else {}
-                )
-
-                id_df = pd.DataFrame(
-                    [
-                        {"Field": "Shipname", "Value": info.get("shipname") or registry.get("shipname", "N/A")},
-                        {"Field": "MMSI", "Value": info.get("ssvid") or registry.get("ssvid", "N/A")},
-                        {"Field": "Flag", "Value": info.get("flag") or registry.get("flag", "N/A")},
-                        {"Field": "IMO", "Value": info.get("imo") or registry.get("imo", "N/A")},
-                        {"Field": "Call Sign", "Value": info.get("callsign") or registry.get("callsign", "N/A")},
-                    ]
-                )
-                st.dataframe(id_df, use_container_width=True, hide_index=True)
-
-            with col_r2:
-                st.markdown("**Registry History**")
-                reg_records = []
-                for r in details.get("registryInfo", []):
-                    reg_records.append(
-                        {
-                            "Source": r.get("sourceCode", "N/A"),
-                            "Name": r.get("shipname", "N/A"),
-                            "Flag": r.get("flag", "N/A"),
-                            "Length (m)": r.get("lengthM", "N/A"),
-                            "Tonnage (GT)": r.get("tonnageGt", "N/A"),
-                            "From": (r.get("transmissionDateFrom", "N/A")[:10] if r.get("transmissionDateFrom") else "N/A"),
-                            "To": (r.get("transmissionDateTo", "N/A")[:10] if r.get("transmissionDateTo") else "N/A"),
-                        }
-                    )
-
-                if reg_records:
-                    st.dataframe(
-                        pd.DataFrame(reg_records),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.info("No registry records found.")
