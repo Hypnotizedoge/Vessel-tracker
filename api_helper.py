@@ -2,7 +2,7 @@ import requests
 import logging
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, date
 import streamlit as st
 import pandas as pd
 
@@ -270,3 +270,225 @@ def get_vessel_events(vessel_id: str, start_date: str, end_date: str) -> list[di
     # Sort chronologically by start time
     consolidated_events.sort(key=lambda x: x["start"] or "")
     return consolidated_events
+
+
+def load_cached_events_from_csv(vessels: list[dict], start_date: date, end_date: date) -> list[dict]:
+    """
+    Load events exclusively from gfw_extracted_data.csv. No API calls are made.
+    Filters the events to only match the selected vessels and requested date range.
+    """
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfw_extracted_data.csv")
+    if not os.path.exists(csv_path):
+        logger.info("CSV cache file does not exist at: %s", csv_path)
+        return []
+        
+    try:
+        df = pd.read_csv(csv_path, dtype=str)
+        # Rename legacy columns if present
+        rename_dict = {}
+        if "activity" in df.columns:
+            rename_dict["activity"] = "type"
+        if "start_time" in df.columns:
+            rename_dict["start_time"] = "start"
+        if "end_time" in df.columns:
+            rename_dict["end_time"] = "end"
+        if rename_dict:
+            df.rename(columns=rename_dict, inplace=True)
+            
+        # Parse numbers
+        if "lat" in df.columns:
+            df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        if "lon" in df.columns:
+            df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+        if "duration_hours" in df.columns:
+            df["duration_hours"] = pd.to_numeric(df["duration_hours"], errors="coerce")
+            
+        # Filter by vessel MMSI
+        mmsis = [v["mmsi"] for v in vessels]
+        if "vessel_mmsi" in df.columns:
+            df = df[df["vessel_mmsi"].isin(mmsis)]
+        else:
+            return []
+            
+        if df.empty:
+            return []
+            
+        # Filter by date range
+        df["start_dt"] = pd.to_datetime(df["start"], errors="coerce")
+        if hasattr(df["start_dt"].dtype, "tz") and df["start_dt"].dt.tz is not None:
+            df["start_dt"] = df["start_dt"].dt.tz_localize(None)
+            
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        
+        mask = (df["start_dt"] >= start_dt) & (df["start_dt"] <= end_dt)
+        filtered_df = df[mask].copy()
+        filtered_df.drop(columns=["start_dt"], errors="ignore", inplace=True)
+        
+        # Sort chronologically
+        if "start" in filtered_df.columns:
+            filtered_df.sort_values(by="start", inplace=True)
+            
+        filtered_df = filtered_df.where(pd.notnull(filtered_df), None)
+        return filtered_df.to_dict(orient="records")
+    except Exception as e:
+        logger.error("Error reading or filtering cached CSV file: %s", e)
+        return []
+
+
+def sync_vessels_with_api(vessels: list[dict]) -> dict:
+    """
+    Sync missing events from GFW API for the list of vessels.
+    Uses gfw_sync_metadata.json to track the last sync date for each vessel.
+    """
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfw_extracted_data.csv")
+    meta_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfw_sync_metadata.json")
+    
+    # 1. Load sync metadata
+    metadata = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except Exception as e:
+            logger.error("Error reading sync metadata file: %s", e)
+            
+    today_str = date.today().isoformat()
+    new_events_list = []
+    synced_count = 0
+    total_new_events = 0
+    
+    for vessel in vessels:
+        vessel_id = vessel["id"]
+        mmsi = vessel["mmsi"]
+        name = vessel["name"]
+        
+        # Determine last sync date
+        last_synced_str = metadata.get(mmsi)
+        if last_synced_str:
+            try:
+                last_synced = date.fromisoformat(last_synced_str)
+            except Exception:
+                last_synced = date.today() - timedelta(days=90)
+        else:
+            # Default to 90 days ago
+            last_synced = date.today() - timedelta(days=90)
+            
+        api_start = last_synced + timedelta(days=1)
+        api_end = date.today()
+        
+        if api_start <= api_end:
+            logger.info("Syncing %s (MMSI: %s) -> Fetching GFW API from %s to %s", name, mmsi, api_start, api_end)
+            fetched = get_vessel_events(vessel_id, api_start.isoformat(), api_end.isoformat())
+            for e in fetched:
+                e["vessel_name"] = name
+                e["vessel_mmsi"] = mmsi
+                e["vessel_flag"] = vessel.get("flag", "N/A")
+                if "start" in e and e["start"]:
+                    e["date"] = e["start"][:10]
+                else:
+                    e["date"] = ""
+                new_events_list.append(e)
+            
+            total_new_events += len(fetched)
+            synced_count += 1
+            # Update sync date to today
+            metadata[mmsi] = today_str
+        else:
+            logger.info("Syncing %s (MMSI: %s) -> Already synced to %s.", name, mmsi, last_synced)
+            # Make sure it's set to today if it was somehow in the future
+            metadata[mmsi] = today_str
+            
+    # Save sync metadata
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+    except Exception as e:
+        logger.error("Failed to save sync metadata: %s", e)
+        
+    # Append to CSV and deduplicate
+    if new_events_list or os.path.exists(csv_path):
+        # Load existing data
+        hist_df = pd.DataFrame()
+        if os.path.exists(csv_path):
+            try:
+                hist_df = pd.read_csv(csv_path, dtype=str)
+                # Map columns internally
+                rename_dict = {}
+                if "activity" in hist_df.columns:
+                    rename_dict["activity"] = "type"
+                if "start_time" in hist_df.columns:
+                    rename_dict["start_time"] = "start"
+                if "end_time" in hist_df.columns:
+                    rename_dict["end_time"] = "end"
+                if rename_dict:
+                    hist_df.rename(columns=rename_dict, inplace=True)
+            except Exception as e:
+                logger.error("Failed to load CSV before append: %s", e)
+                hist_df = pd.DataFrame()
+                
+        # Merge
+        combined_df = hist_df
+        if new_events_list:
+            new_df = pd.DataFrame(new_events_list)
+            if "raw" in new_df.columns:
+                new_df.drop(columns=["raw"], inplace=True)
+            if combined_df.empty:
+                combined_df = new_df
+            else:
+                for col in new_df.columns:
+                    if col not in combined_df.columns:
+                        combined_df[col] = None
+                for col in combined_df.columns:
+                    if col not in new_df.columns:
+                        new_df[col] = None
+                combined_df = pd.concat([combined_df, new_df], ignore_index=True)
+                
+        if not combined_df.empty:
+            # Deduplicate
+            dup_subset = ["vessel_mmsi", "type", "start", "lat", "lon"]
+            dup_subset = [col for col in dup_subset if col in combined_df.columns]
+            combined_df.drop_duplicates(subset=dup_subset, keep="last", inplace=True)
+            
+            # Sort chronologically
+            if "start" in combined_df.columns:
+                combined_df.sort_values(by="start", inplace=True)
+                
+            # Rename back to legacy for compatibility
+            save_df = combined_df.copy()
+            save_rename = {}
+            if "type" in save_df.columns:
+                save_rename["type"] = "activity"
+            if "start" in save_df.columns:
+                save_rename["start"] = "start_time"
+            if "end" in save_df.columns:
+                save_rename["end"] = "end_time"
+            if save_rename:
+                save_df.rename(columns=save_rename, inplace=True)
+                
+            preferred_cols = [
+                "vessel_name", "vessel_mmsi", "vessel_flag", "date", 
+                "activity", "lat", "lon", "duration_hours", 
+                "start_time", "end_time", "detail", "id"
+            ]
+            cols_to_save = [col for col in preferred_cols if col in save_df.columns]
+            for col in save_df.columns:
+                if col not in cols_to_save:
+                    cols_to_save.append(col)
+                    
+            try:
+                save_df[cols_to_save].to_csv(csv_path, index=False)
+                logger.info("CSV cache updated successfully at %s", csv_path)
+            except Exception as e:
+                logger.error("Failed to write updated CSV cache: %s", e)
+                
+    return {
+        "success": True,
+        "vessels_synced": synced_count,
+        "new_events_fetched": total_new_events
+    }
+
+
+
+
+
