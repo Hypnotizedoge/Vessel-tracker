@@ -1,0 +1,27 @@
+name: Scrape Data and Save to CSV
+
+on:
+  workflow_dispatch:  # Allows manual triggering
+  schedule:
+    - cron: '0 10 * * *'  # Runs daily at 10 AM UTC
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4  # Update to v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4  # Update to v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt  # If you have a requirements.txt file
+
+      - name: Run scraping script
+        run: |
+          python KGB-WB.py
